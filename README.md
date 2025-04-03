@@ -872,3 +872,1015 @@ chmod +x $HOME/analyze_fees.sh
 # Запуск скрипта управления комиссиями в первый раз
 $HOME/manage_fees.sh
 ```
+# Настройка IBC-релеера между Osmosis и Cosmos Hub с поддержкой комиссий
+
+## Шаг 16: Настройка мониторинга и оповещений
+
+```bash
+# Установка необходимых инструментов для мониторинга
+sudo apt-get update
+sudo apt-get install -y prometheus prometheus-node-exporter grafana
+
+# Создание конфигурации Prometheus для мониторинга Hermes
+cat > /etc/prometheus/prometheus.yml << EOF
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node_exporter'
+    static_configs:
+      - targets: ['localhost:9100']
+
+  - job_name: 'hermes'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['localhost:3001']
+EOF
+
+# Перезапуск Prometheus для применения новой конфигурации
+sudo systemctl restart prometheus
+
+# Создание скрипта для мониторинга состояния Hermes
+cat > $HOME/monitor_hermes.sh << 'EOF'
+#!/bin/bash
+
+# Параметры
+LOG_FILE="$HOME/hermes_monitor.log"
+ALERT_THRESHOLD=5
+ALERT_EMAIL="your_email@example.com"
+TELEGRAM_BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID="YOUR_TELEGRAM_CHAT_ID"
+
+# Функция для логирования
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOG_FILE
+}
+
+# Функция для отправки оповещений
+send_alert() {
+    local message="$1"
+    log "ALERT: $message"
+    
+    # Отправка по электронной почте
+    echo "$message" | mail -s "Hermes IBC Relayer Alert" $ALERT_EMAIL
+    
+    # Отправка в Telegram
+    curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+        -d chat_id="$TELEGRAM_CHAT_ID" \
+        -d text="🚨 IBC Relayer Alert: $message" \
+        -d parse_mode="Markdown"
+}
+
+# Проверка статуса службы Hermes
+check_hermes_service() {
+    if ! systemctl is-active --quiet hermes; then
+        send_alert "Hermes service is not running! Attempting to restart..."
+        sudo systemctl restart hermes
+        sleep 10
+        if ! systemctl is-active --quiet hermes; then
+            send_alert "Failed to restart Hermes service. Manual intervention required."
+        else
+            send_alert "Hermes service successfully restarted."
+        fi
+    fi
+}
+
+# Проверка состояния каналов
+check_channels() {
+    # Проверка канала Cosmos Hub -> Osmosis
+    local cosmos_channel_status=$(hermes query channel end --chain cosmoshub-4 --port transfer --channel channel-X 2>&1)
+    if echo "$cosmos_channel_status" | grep -q "error"; then
+        send_alert "Issue with Cosmos Hub channel: $cosmos_channel_status"
+    fi
+    
+    # Проверка канала Osmosis -> Cosmos Hub
+    local osmosis_channel_status=$(hermes query channel end --chain osmosis-1 --port transfer --channel channel-Y 2>&1)
+    if echo "$osmosis_channel_status" | grep -q "error"; then
+        send_alert "Issue with Osmosis channel: $osmosis_channel_status"
+    fi
+}
+
+# Проверка ожидающих пакетов
+check_pending_packets() {
+    # Проверка ожидающих пакетов в Cosmos Hub
+    local cosmos_pending=$(hermes query packet pending --chain cosmoshub-4 --port transfer --channel channel-X 2>/dev/null | grep -c "packet" || echo "0")
+    
+    # Проверка ожидающих пакетов в Osmosis
+    local osmosis_pending=$(hermes query packet pending --chain osmosis-1 --port transfer --channel channel-Y 2>/dev/null | grep -c "packet" || echo "0")
+    
+    log "Pending packets - Cosmos Hub: $cosmos_pending, Osmosis: $osmosis_pending"
+    
+    # Оповещение, если количество ожидающих пакетов превышает порог
+    if [ "$cosmos_pending" -gt "$ALERT_THRESHOLD" ]; then
+        send_alert "High number of pending packets on Cosmos Hub: $cosmos_pending"
+    fi
+    
+    if [ "$osmosis_pending" -gt "$ALERT_THRESHOLD" ]; then
+        send_alert "High number of pending packets on Osmosis: $osmosis_pending"
+    fi
+}
+
+# Проверка баланса кошельков релеера
+check_wallet_balances() {
+    # Получение адреса кошелька для Cosmos Hub
+    local cosmos_address=$(hermes keys show --chain cosmoshub-4 2>/dev/null | grep "address:" | awk '{print $2}')
+    
+    # Получение адреса кошелька для Osmosis
+    local osmosis_address=$(hermes keys show --chain osmosis-1 2>/dev/null | grep "address:" | awk '{print $2}')
+    
+    # Проверка баланса Cosmos Hub
+    local cosmos_balance=$(gaiad query bank balances $cosmos_address --node https://rpc.cosmos.network:443 -o json 2>/dev/null | jq -r '.balances[] | select(.denom=="uatom") | .amount' || echo "0")
+    
+    # Проверка баланса Osmosis
+    local osmosis_balance=$(osmosisd query bank balances $osmosis_address --node https://rpc.osmosis.zone:443 -o json 2>/dev/null | jq -r '.balances[] | select(.denom=="uosmo") | .amount' || echo "0")
+    
+    log "Wallet balances - Cosmos Hub: $cosmos_balance uatom, Osmosis: $osmosis_balance uosmo"
+    
+    # Пороговые значения для оповещений (в микроединицах)
+    local cosmos_threshold=1000000  # 1 ATOM
+    local osmosis_threshold=1000000  # 1 OSMO
+    
+    if [ "$cosmos_balance" -lt "$cosmos_threshold" ]; then
+        send_alert "Low balance on Cosmos Hub wallet: $cosmos_balance uatom"
+    fi
+    
+    if [ "$osmosis_balance" -lt "$osmosis_threshold" ]; then
+        send_alert "Low balance on Osmosis wallet: $osmosis_balance uosmo"
+    fi
+}
+
+# Проверка доходов от комиссий
+check_fee_earnings() {
+    # Получение адреса кошелька для Cosmos Hub
+    local cosmos_address=$(hermes keys show --chain cosmoshub-4 2>/dev/null | grep "address:" | awk '{print $2}')
+    
+    # Получение адреса кошелька для Osmosis
+    local osmosis_address=$(hermes keys show --chain osmosis-1 2>/dev/null | grep "address:" | awk '{print $2}')
+    
+    # Получение истории транзакций для анализа комиссий
+    local cosmos_txs=$(gaiad query txs --events "transfer.recipient=$cosmos_address" --node https://rpc.cosmos.network:443 -o json 2>/dev/null)
+    local osmosis_txs=$(osmosisd query txs --events "transfer.recipient=$osmosis_address" --node https://rpc.osmosis.zone:443 -o json 2>/dev/null)
+    
+    # Анализ доходов от комиссий (упрощенно)
+    local cosmos_fee_count=$(echo "$cosmos_txs" | jq -r '.total_count' 2>/dev/null || echo "0")
+    local osmosis_fee_count=$(echo "$osmosis_txs" | jq -r '.total_count' 2>/dev/null || echo "0")
+    
+    log "Fee transactions - Cosmos Hub: $cosmos_fee_count, Osmosis: $osmosis_fee_count"
+}
+
+# Основная функция мониторинга
+main() {
+    log "Starting Hermes monitoring..."
+    
+    # Проверка статуса службы
+    check_hermes_service
+    
+    # Проверка состояния каналов
+    check_channels
+    
+    # Проверка ожидающих пакетов
+    check_pending_packets
+    
+    # Проверка баланса кошельков
+    check_wallet_balances
+    
+    # Проверка доходов от комиссий
+    check_fee_earnings
+    
+    log "Monitoring completed."
+}
+
+# Запуск основной функции
+main
+EOF
+
+chmod +x $HOME/monitor_hermes.sh
+
+# Настройка автоматического запуска скрипта мониторинга через cron
+(crontab -l 2>/dev/null; echo "*/15 * * * * $HOME/monitor_hermes.sh > /dev/null 2>&1") | crontab -
+
+# Создание дашборда Grafana для Hermes
+cat > $HOME/hermes_dashboard.json << 'EOF'
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": 1,
+  "links": [],
+  "panels": [
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "fill": 1,
+      "fillGradient": 0,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "hiddenSeries": false,
+      "id": 2,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "nullPointMode": "null",
+      "options": {
+        "alertThreshold": true
+      },
+      "percentage": false,
+      "pluginVersion": "7.3.7",
+      "pointradius": 2,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "hermes_client_updates_total",
+          "interval": "",
+          "legendFormat": "Client Updates",
+          "refId": "A"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "IBC Client Updates",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "fill": 1,
+      "fillGradient": 0,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "hiddenSeries": false,
+      "id": 4,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "nullPointMode": "null",
+      "options": {
+        "alertThreshold": true
+      },
+      "percentage": false,
+      "pluginVersion": "7.3.7",
+      "pointradius": 2,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "hermes_packets_relayed_total",
+          "interval": "",
+          "legendFormat": "Packets Relayed",
+          "refId": "A"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "IBC Packets Relayed",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 26,
+  "style": "dark",
+  "tags": [],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Hermes IBC Relayer Dashboard",
+  "uid": "hermes_ibc",
+  "version": 1
+}
+EOF
+
+## Шаг 16: Настройка мониторинга и оповещений (продолжение)
+
+```bash
+# Настройка Grafana для импорта дашборда (продолжение)
+sudo systemctl enable grafana-server
+sudo systemctl start grafana-server
+
+# Создание API ключа для автоматического импорта дашборда
+GRAFANA_API_KEY=$(curl -X POST -H "Content-Type: application/json" -d '{"name":"auto-import", "role": "Admin"}' http://admin:admin@localhost:3000/api/auth/keys | jq -r .key)
+
+# Импорт дашборда в Grafana
+curl -X POST \
+  -H "Authorization: Bearer $GRAFANA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d @$HOME/hermes_dashboard.json \
+  http://localhost:3000/api/dashboards/db
+
+# Создание скрипта для проверки здоровья релеера
+cat > $HOME/health_check.sh << 'EOF'
+#!/bin/bash
+
+# Проверка статуса Hermes
+hermes_status=$(systemctl is-active hermes)
+if [ "$hermes_status" != "active" ]; then
+    echo "CRITICAL: Hermes service is not running!"
+    exit 2
+fi
+
+# Проверка соединения с цепями
+cosmos_status=$(hermes query client state --chain cosmoshub-4 --client 07-tendermint-0 2>&1)
+if echo "$cosmos_status" | grep -q "error"; then
+    echo "WARNING: Cannot connect to Cosmos Hub: $cosmos_status"
+    exit 1
+fi
+
+osmosis_status=$(hermes query client state --chain osmosis-1 --client 07-tendermint-0 2>&1)
+if echo "$osmosis_status" | grep -q "error"; then
+    echo "WARNING: Cannot connect to Osmosis: $osmosis_status"
+    exit 1
+fi
+
+# Проверка задержки клиентов
+cosmos_delay=$(hermes query client consensus --chain cosmoshub-4 --client 07-tendermint-0 2>&1 | grep -o "latest_height=.*" | cut -d'=' -f2)
+osmosis_delay=$(hermes query client consensus --chain osmosis-1 --client 07-tendermint-0 2>&1 | grep -o "latest_height=.*" | cut -d'=' -f2)
+
+if [ -z "$cosmos_delay" ] || [ -z "$osmosis_delay" ]; then
+    echo "WARNING: Cannot determine client delays"
+    exit 1
+fi
+
+echo "OK: Hermes is running properly. Cosmos Hub delay: $cosmos_delay, Osmosis delay: $osmosis_delay"
+exit 0
+EOF
+
+chmod +x $HOME/health_check.sh
+
+# Настройка Prometheus Node Exporter для пользовательских метрик
+cat > $HOME/node_exporter_textfile.sh << 'EOF'
+#!/bin/bash
+
+METRICS_DIR="/var/lib/node_exporter/textfile_collector"
+sudo mkdir -p $METRICS_DIR
+
+# Функция для получения баланса
+get_balance() {
+    local chain=$1
+    local address=$2
+    local denom=$3
+    local node=$4
+    
+    if [ "$chain" == "cosmoshub" ]; then
+        gaiad query bank balances $address --node $node -o json 2>/dev/null | \
+        jq -r --arg denom "$denom" '.balances[] | select(.denom==$denom) | .amount' || echo "0"
+    elif [ "$chain" == "osmosis" ]; then
+        osmosisd query bank balances $address --node $node -o json 2>/dev/null | \
+        jq -r --arg denom "$denom" '.balances[] | select(.denom==$denom) | .amount' || echo "0"
+    else
+        echo "0"
+    fi
+}
+
+# Получение адресов кошельков
+cosmos_address=$(hermes keys show --chain cosmoshub-4 2>/dev/null | grep "address:" | awk '{print $2}')
+osmosis_address=$(hermes keys show --chain osmosis-1 2>/dev/null | grep "address:" | awk '{print $2}')
+
+# Получение балансов
+cosmos_balance=$(get_balance "cosmoshub" "$cosmos_address" "uatom" "https://rpc.cosmos.network:443")
+osmosis_balance=$(get_balance "osmosis" "$osmosis_address" "uosmo" "https://rpc.osmosis.zone:443")
+
+# Запись метрик в файл
+cat > $METRICS_DIR/hermes_balances.prom << EOF
+# HELP hermes_wallet_balance Current balance of the relayer wallet
+# TYPE hermes_wallet_balance gauge
+hermes_wallet_balance{chain="cosmoshub",denom="uatom"} $cosmos_balance
+hermes_wallet_balance{chain="osmosis",denom="uosmo"} $osmosis_balance
+EOF
+
+# Получение статистики по пакетам
+cosmos_pending=$(hermes query packet pending --chain cosmoshub-4 --port transfer --channel channel-X 2>/dev/null | grep -c "packet" || echo "0")
+osmosis_pending=$(hermes query packet pending --chain osmosis-1 --port transfer --channel channel-Y 2>/dev/null | grep -c "packet" || echo "0")
+
+# Запись метрик пакетов в файл
+cat > $METRICS_DIR/hermes_packets.prom << EOF
+# HELP hermes_pending_packets Number of pending IBC packets
+# TYPE hermes_pending_packets gauge
+hermes_pending_packets{chain="cosmoshub",direction="outgoing"} $cosmos_pending
+hermes_pending_packets{chain="osmosis",direction="outgoing"} $osmosis_pending
+EOF
+
+# Получение статуса здоровья
+health_status=$($HOME/health_check.sh > /dev/null 2>&1; echo $?)
+
+# Запись метрики здоровья в файл
+cat > $METRICS_DIR/hermes_health.prom << EOF
+# HELP hermes_health_status Health status of the Hermes relayer (0=OK, 1=WARNING, 2=CRITICAL)
+# TYPE hermes_health_status gauge
+hermes_health_status $health_status
+EOF
+EOF
+
+chmod +x $HOME/node_exporter_textfile.sh
+
+# Настройка cron для регулярного обновления метрик
+(crontab -l 2>/dev/null; echo "*/5 * * * * $HOME/node_exporter_textfile.sh > /dev/null 2>&1") | crontab -
+
+# Настройка Node Exporter для чтения пользовательских метрик
+sudo sed -i 's/^ExecStart=.*/ExecStart=\/usr\/bin\/prometheus-node-exporter --collector.textfile.directory=\/var\/lib\/node_exporter\/textfile_collector/' /etc/systemd/system/prometheus-node-exporter.service
+
+sudo systemctl daemon-reload
+sudo systemctl restart prometheus-node-exporter
+
+# Создание скрипта для резервного копирования ключей и конфигурации
+cat > $HOME/backup_hermes.sh << 'EOF'
+#!/bin/bash
+
+BACKUP_DIR="$HOME/hermes_backups"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="$BACKUP_DIR/hermes_backup_$TIMESTAMP.tar.gz"
+
+# Создание директории для резервных копий
+mkdir -p $BACKUP_DIR
+
+# Остановка службы Hermes перед резервным копированием
+sudo systemctl stop hermes
+
+# Создание резервной копии
+tar -czf $BACKUP_FILE \
+    $HOME/.hermes/config.toml \
+    $HOME/.hermes/keys \
+    $HOME/hermes_service.sh \
+    $HOME/monitor_hermes.sh \
+    $HOME/health_check.sh \
+    $HOME/node_exporter_textfile.sh
+
+# Запуск службы Hermes после резервного копирования
+sudo systemctl start hermes
+
+# Удаление старых резервных копий (оставляем только 7 последних)
+ls -t $BACKUP_DIR/hermes_backup_*.tar.gz | tail -n +8 | xargs -r rm
+
+echo "Backup completed: $BACKUP_FILE"
+EOF
+
+chmod +x $HOME/backup_hermes.sh
+
+# Настройка еженедельного резервного копирования
+(crontab -l 2>/dev/null; echo "0 0 * * 0 $HOME/backup_hermes.sh > /dev/null 2>&1") | crontab -
+
+# Создание скрипта для автоматического обновления Hermes
+cat > $HOME/update_hermes.sh << 'EOF'
+#!/bin/bash
+
+# Параметры
+LOG_FILE="$HOME/hermes_update.log"
+BACKUP_SCRIPT="$HOME/backup_hermes.sh"
+HERMES_REPO="https://github.com/informalsystems/hermes.git"
+HERMES_VERSION="v1.7.4"  # Обновите до нужной версии
+
+# Функция для логирования
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOG_FILE
+}
+
+# Создание резервной копии перед обновлением
+log "Creating backup before update..."
+$BACKUP_SCRIPT
+if [ $? -ne 0 ]; then
+    log "Backup failed. Aborting update."
+    exit 1
+fi
+
+# Остановка службы Hermes
+log "Stopping Hermes service..."
+sudo systemctl stop hermes
+
+# Клонирование репозитория и сборка новой версии
+log "Cloning Hermes repository..."
+cd $HOME
+git clone $HERMES_REPO hermes_update
+cd hermes_update
+git checkout $HERMES_VERSION
+
+log "Building Hermes $HERMES_VERSION..."
+cargo build --release --bin hermes
+
+# Проверка успешности сборки
+if [ $? -ne 0 ]; then
+    log "Build failed. Reverting to previous version."
+    cd $HOME
+    rm -rf hermes_update
+    sudo systemctl start hermes
+    exit 1
+fi
+
+# Замена исполняемого файла
+log "Installing new Hermes binary..."
+sudo cp $HOME/hermes_update/target/release/hermes /usr/local/bin/hermes
+sudo chmod +x /usr/local/bin/hermes
+
+# Очистка
+cd $HOME
+rm -rf hermes_update
+
+# Запуск службы Hermes
+log "Starting Hermes service with new version..."
+sudo systemctl start hermes
+
+# Проверка статуса
+sleep 10
+if systemctl is-active --quiet hermes; then
+    log "Update completed successfully. Hermes $HERMES_VERSION is now running."
+else
+    log "Error: Hermes service failed to start after update."
+    exit 1
+fi
+
+# Проверка версии
+hermes_version=$(hermes version)
+log "Installed Hermes version: $hermes_version"
+EOF
+
+chmod +x $HOME/update_hermes.sh
+
+echo "Мониторинг и оповещения настроены успешно. Grafana доступна по адресу http://YOUR_SERVER_IP:3000 (логин: admin, пароль: admin)"
+```
+
+## Шаг 17: Настройка безопасности и оптимизация производительности
+
+```bash
+# Настройка файрвола для защиты сервера
+sudo apt-get install -y ufw
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+
+# Разрешение только необходимых портов
+sudo ufw allow ssh
+sudo ufw allow 3000/tcp  # Grafana
+sudo ufw allow 9090/tcp  # Prometheus
+sudo ufw allow 26656/tcp  # Tendermint P2P
+sudo ufw allow 26657/tcp  # Tendermint RPC
+
+# Включение файрвола
+sudo ufw --force enable
+
+# Настройка fail2ban для защиты от брутфорс-атак
+sudo apt-get install -y fail2ban
+sudo systemctl enable fail2ban
+sudo systemctl start fail2ban
+
+# Создание конфигурации для оптимизации системы
+cat > /etc/sysctl.d/99-hermes-tuning.conf << EOF
+# Увеличение лимитов для сетевых соединений
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65536
+net.ipv4.tcp_max_syn_backlog = 65536
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 10
+
+# Оптимизация использования памяти
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+EOF
+
+# Применение настроек системы
+sudo sysctl -p /etc/sysctl.d/99-hermes-tuning.conf
+
+# Настройка лимитов открытых файлов
+cat > /etc/security/limits.d/hermes.conf << EOF
+# Увеличение лимитов открытых файлов для пользователя
+$USER soft nofile 65536
+$USER hard nofile 65536
+EOF
+
+# Оптимизация конфигурации Hermes для производительности
+cat > $HOME/.hermes/config.toml.optimized << 'EOF'
+[global]
+log_level = 'info'
+
+# Увеличение тайм-аутов для улучшения стабильности
+[rest]
+enabled = true
+host = '127.0.0.1'
+port = 3000
+
+[telemetry]
+enabled = true
+host = '127.0.0.1'
+port = 3001
+
+[mode]
+clients = 'enabled'
+connections = 'enabled'
+channels = 'enabled'
+packets = 'enabled'
+
+# Оптимизация параметров для улучшения производительности
+[mode.packets.filter]
+min_fees = [
+    { denom = 'uatom', amount = '100' },
+    { denom = 'uosmo', amount = '100' },
+]
+
+[chains]
+# Конфигурация для Cosmos Hub
+[chains.cosmoshub-4]
+id = 'cosmoshub-4'
+rpc_addr = 'https://rpc.cosmos.network:443'
+grpc_addr = 'https://grpc.cosmos.network:443'
+websocket_addr = 'wss://rpc.cosmos.network:443/websocket'
+rpc_timeout = '30s'
+account_prefix = 'cosmos'
+key_name = 'cosmos'
+store_prefix = 'ibc'
+default_gas = 300000
+max_gas = 3000000
+gas_price = { price = 0.025, denom = 'uatom' }
+gas_multiplier = 1.3
+max_msg_num = 30
+max_tx_size = 180000
+clock_drift = '15s'
+max_block_time = '30s'
+trusting_period = '14days'
+trust_threshold = { numerator = '1', denominator = '3' }
+memo_prefix = 'Relayed by Hermes'
+[chains.cosmoshub-4.packet_filter]
+policy = 'allow'
+list = [
+  ['transfer', 'channel-X'],
+]
+
+# Конфигурация для Osmosis
+[chains.osmosis-1]
+id = 'osmosis-1'
+rpc_addr = 'https://rpc.osmosis.zone:443'
+grpc_addr = 'https://grpc.osmosis.zone:443'
+websocket_addr = 'wss://rpc.osmosis.zone:443/websocket'
+rpc_timeout = '30s'
+account_prefix = 'osmo'
+key_name = 'osmosis'
+store_prefix = 'ibc'
+default_gas = 300000
+max_gas = 3000000
+gas_price = { price = 0.025, denom = 'uosmo' }
+gas_multiplier = 1.3
+max_msg_num = 30
+max_tx_size = 180000
+clock_drift = '15s'
+max_block_time = '30s'
+trusting_period = '14days'
+trust_threshold = { numerator = '1', denominator = '3' }
+memo_prefix = 'Relayed by Hermes'
+[chains.osmosis-1.packet_filter]
+policy = 'allow'
+list = [
+  ['transfer', 'channel-Y'],
+]
+EOF
+
+# Сравнение конфигураций и применение оптимизированной версии
+diff -u $HOME/.hermes/config.toml $HOME/.hermes/config.toml.optimized
+read -p "Применить оптимизированную конфигурацию? (y/n): " apply_config
+if [ "$apply_config" = "y" ]; then
+  cp $HOME/.hermes/config.toml.optimized $HOME/.hermes/config.toml
+  sudo systemctl restart hermes
+  echo "Оптимизированная конфигурация применена"
+else
+  echo "Оптимизированная конфигурация сохранена как $HOME/.hermes/config.toml.optimized"
+fi
+
+# Настройка автоматической очистки логов
+cat > /etc/logrotate.d/hermes << EOF
+$HOME/hermes.log {
+  daily
+  rotate 7
+  compress
+  delaycompress
+  missingok
+  notifempty
+  create 0640 $USER $USER
+  postrotate
+    systemctl reload hermes >/dev/null 2>&1 || true
+  endscript
+}
+EOF
+
+# Создание скрипта для проверки и восстановления соединений
+cat > $HOME/check_connections.sh << 'EOF'
+#!/bin/bash
+
+LOG_FILE="$HOME/connection_check.log"
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> $LOG_FILE
+}
+
+log "Starting connection check..."
+
+# Проверка клиентов
+check_client() {
+  local chain=$1
+  local client=$2
+  
+  status=$(hermes query client state --chain $chain --client $client 2>&1)
+  
+  if echo "$status" | grep -q "error"; then
+    log "Client issue detected on $chain for $client"
+    log "Attempting to update client..."
+    hermes update client --host-chain $chain --client $client
+    return 1
+  fi
+  
+  return 0
+}
+
+# Проверка соединений
+check_connection() {
+  local chain_a=$1
+  local chain_b=$2
+  local conn_id=$3
+  
+  status=$(hermes query connection end --chain $chain_a --connection $conn_id 2>&1)
+  
+  if echo "$status" | grep -q "error"; then
+    log "Connection issue detected on $chain_a for $conn_id"
+    return 1
+  fi
+  
+  return 0
+}
+
+# Проверка каналов
+check_channel() {
+  local chain=$1
+  local port=$2
+  local channel=$3
+  
+  status=$(hermes query channel end --chain $chain --port $port --channel $channel 2>&1)
+  
+  if echo "$status" | grep -q "error"; then
+    log "Channel issue detected on $chain for $port/$channel"
+    return 1
+  fi
+  
+  return 0
+}
+
+# Проверка клиентов
+client_issues=0
+check_client "cosmoshub-4" "07-tendermint-0" || ((client_issues++))
+check_client "osmosis-1" "07-tendermint-0" || ((client_issues++))
+
+# Проверка соединений
+connection_issues=0
+check_connection "cosmoshub-4" "osmosis-1" "connection-0" || ((connection_issues++))
+check_connection "osmosis-1" "cosmoshub-4" "connection-0" || ((connection_issues++))
+
+# Проверка каналов
+channel_issues=0
+check_channel "cosmoshub-4" "transfer" "channel-X" || ((channel_issues++))
+check_channel "osmosis-1" "transfer" "channel-Y" || ((channel_issues++))
+
+# Проверка наличия зависших пакетов
+pending_packets_cosmos=$(hermes query packet pending --chain cosmoshub-4 --port transfer --channel channel-X 2>/dev/null | grep -c "packet" || echo "0")
+pending_packets_osmosis=$(hermes query packet pending --chain osmosis-1 --port transfer --channel channel-Y 2>/dev/null | grep -c "packet" || echo "0")
+
+if [ "$pending_packets_cosmos" -gt 0 ] || [ "$pending_packets_osmosis" -gt 0 ]; then
+  log "Pending packets detected: Cosmos Hub ($pending_packets_cosmos), Osmosis ($pending_packets_osmosis)"
+  log "Attempting to clear packets..."
+  
+  hermes clear packets --chain cosmoshub-4 --port transfer --channel channel-X
+  hermes clear packets --chain osmosis-1 --port transfer --channel channel-Y
+fi
+
+total_issues=$((client_issues + connection_issues + channel_issues))
+if [ "$total_issues" -gt 0 ]; then
+  log "Total issues found: $total_issues. Restarting Hermes service..."
+  sudo systemctl restart hermes
+else
+  log "No issues found. Hermes is running properly."
+fi
+EOF
+
+chmod +x $HOME/check_connections.sh
+
+# Настройка регулярной проверки соединений
+(crontab -l 2>/dev/null; echo "*/30 * * * * $HOME/check_connections.sh > /dev/null 2>&1") | crontab -
+
+# Создание скрипта для мониторинга использования ресурсов
+cat > $HOME/monitor_resources.sh << 'EOF'
+#!/bin/bash
+
+LOG_FILE="$HOME/resource_usage.log"
+THRESHOLD_CPU=80
+THRESHOLD_MEM=80
+THRESHOLD_DISK=85
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> $LOG_FILE
+}
+
+# Получение использования CPU
+cpu_usage=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}')
+cpu_usage_int=${cpu_usage%.*}
+
+# Получение использования памяти
+mem_usage=$(free | grep Mem | awk '{print $3/$2 * 100.0}')
+mem_usage_int=${mem_usage%.*}
+
+# Получение использования диска
+disk_usage=$(df -h / | awk 'NR==2 {print $5}' | tr -d '%')
+
+log "Resource usage - CPU: ${cpu_usage}%, Memory: ${mem_usage}%, Disk: ${disk_usage}%"
+
+# Проверка превышения пороговых значений
+if [ "$cpu_usage_int" -gt "$THRESHOLD_CPU" ]; then
+  log "WARNING: High CPU usage detected: ${cpu_usage}%"
+fi
+
+if [ "$mem_usage_int" -gt "$THRESHOLD_MEM" ]; then
+  log "WARNING: High memory usage detected: ${mem_usage}%"
+fi
+
+if [ "$disk_usage" -gt "$THRESHOLD_DISK" ]; then
+  log "WARNING: High disk usage detected: ${disk_usage}%"
+fi
+
+# Проверка использования ресурсов процессом Hermes
+hermes_pid=$(pgrep hermes)
+if [ -n "$hermes_pid" ]; then
+  hermes_cpu=$(ps -p $hermes_pid -o %cpu | tail -n 1 | tr -d ' ')
+  hermes_mem=$(ps -p $hermes_pid -o %mem | tail -n 1 | tr -d ' ')
+  log "Hermes process - CPU: ${hermes_cpu}%, Memory: ${hermes_mem}%"
+  
+  # Перезапуск Hermes при чрезмерном использовании ресурсов
+  if (( $(echo "$hermes_cpu > 50" | bc -l) )) || (( $(echo "$hermes_mem > 40" | bc -l) )); then
+    log "WARNING: Hermes is using excessive resources. Restarting service..."
+    sudo systemctl restart hermes
+  fi
+else
+  log "ERROR: Hermes process not found!"
+  sudo systemctl start hermes
+fi
+EOF
+
+chmod +x $HOME/monitor_resources.sh
+
+# Настройка регулярного мониторинга ресурсов
+(crontab -l 2>/dev/null; echo "*/15 * * * * $HOME/monitor_resources.sh > /dev/null 2>&1") | crontab -
+
+echo "Настройка безопасности и оптимизация производительности завершены успешно."
+
+# Финальное сообщение
+echo "=========================================================="
+echo "Установка и настройка Hermes релеера завершена успешно!"
+echo "=========================================================="
+echo "Важные команды:"
+echo "- Проверка статуса: sudo systemctl status hermes"
+echo "- Просмотр логов: journalctl -u hermes -f"
+echo "- Мониторинг: http://YOUR_SERVER_IP:3000 (Grafana)"
+echo "- Резервное копирование: $HOME/backup_hermes.sh"
+echo "- Проверка соединений: $HOME/check_connections.sh"
+echo "- Мониторинг ресурсов: $HOME/monitor_resources.sh"
+echo "- Обновление Hermes: $HOME/update_hermes.sh"
+echo ""
+echo "Не забудьте сохранить мнемоническую фразу в безопасном месте!"
+echo "=========================================================="
