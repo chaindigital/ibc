@@ -872,7 +872,6 @@ chmod +x $HOME/analyze_fees.sh
 # Запуск скрипта управления комиссиями в первый раз
 $HOME/manage_fees.sh
 ```
-# Настройка IBC-релеера между Osmosis и Cosmos Hub с поддержкой комиссий
 
 ## Шаг 16: Настройка мониторинга и оповещений
 
@@ -1296,9 +1295,7 @@ cat > $HOME/hermes_dashboard.json << 'EOF'
 }
 EOF
 
-## Шаг 16: Настройка мониторинга и оповещений (продолжение)
 
-```bash
 # Настройка Grafana для импорта дашборда (продолжение)
 sudo systemctl enable grafana-server
 sudo systemctl start grafana-server
